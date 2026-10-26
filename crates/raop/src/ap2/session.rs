@@ -1140,13 +1140,6 @@ impl Ap2Session {
         let (producer, mut consumer) =
             rtrb::RingBuffer::<[i16; SAMPLES_PER_PACKET]>::new(ring_capacity);
         let feeder_stop = Arc::new(AtomicBool::new(false));
-        let feeder = pipeline::start_pipeline_feeder(
-            source,
-            producer,
-            metrics.clone(),
-            feeder_stop.clone(),
-            Duration::from_millis(50),
-        )?;
         let rt_metrics = metrics.clone();
         let live = source_is_live;
         let started = Self::start(cfg, move |pcm: &mut [i16; SAMPLES_PER_PACKET]| {
@@ -1174,15 +1167,28 @@ impl Ap2Session {
         .await;
         match started {
             Ok(mut s) => {
-                s.aux_stops.push(feeder_stop);
-                s.threads.push(feeder);
-                Ok(s)
+                // Pairing and RTSP setup can take seconds. Starting capture
+                // before them fills the ring with stale live audio, which is
+                // then dropped in a burst at packet zero.
+                match pipeline::start_pipeline_feeder(
+                    source,
+                    producer,
+                    metrics,
+                    feeder_stop.clone(),
+                    Duration::from_millis(50),
+                ) {
+                    Ok(feeder) => {
+                        s.aux_stops.push(feeder_stop);
+                        s.threads.push(feeder);
+                        Ok(s)
+                    }
+                    Err(error) => {
+                        s.stop().await;
+                        Err(error.into())
+                    }
+                }
             }
-            Err(e) => {
-                feeder_stop.store(true, Ordering::Relaxed);
-                let _ = feeder.join();
-                Err(e)
-            }
+            Err(error) => Err(error),
         }
     }
 

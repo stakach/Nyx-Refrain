@@ -951,6 +951,7 @@ impl Ap2Session {
             let stop = stop.clone();
             let stats = stats.clone();
             let latency = cfg.latency_frames as u32; // two's complement for negative values
+            let prefill = Duration::from_millis(cfg.prefill_ms as u64);
             let sync_flag = cfg.sync_flag;
             let history = history.clone();
             sock.set_read_timeout(Some(Duration::from_millis(50)))?;
@@ -964,7 +965,9 @@ impl Ap2Session {
                         let mut pkt = [0u8; super::history::MAX_PACKET];
                         let mut resp = [0u8; 4 + super::history::MAX_PACKET];
                         let mut first = true;
-                        let mut next = start_at;
+                        // Announce the playback clock before early audio packets
+                        // arrive; both still refer to the same start_at timeline.
+                        let mut next = start_at.checked_sub(prefill).unwrap_or(start_at);
                         while !stop.load(Ordering::Relaxed) {
                             let now = Instant::now();
                             if now >= next {

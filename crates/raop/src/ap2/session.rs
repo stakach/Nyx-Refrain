@@ -71,6 +71,12 @@ pub enum Ap2Error {
     Closed,
 }
 
+// Some Samsung AirPlay 2 receivers apply a volume change but answer 500.
+// The RTSP response is still consumed, so the encrypted control channel stays in sync.
+fn is_volume_server_error(error: &Ap2Error) -> bool {
+    matches!(error, Ap2Error::Status { method, status: 500, .. } if method == "SET_PARAMETER")
+}
+
 #[derive(Debug, Clone)]
 pub struct Ap2Config {
     pub target: SocketAddr,
@@ -829,25 +835,34 @@ impl Ap2Session {
         let rtp0 = clock.rtp_ts(start_at);
         let rtp_info = format!("seq={seq0};rtptime={rtp0}");
 
-        conn.request(
-            false,
-            "SET_PARAMETER",
-            &uri,
-            &[],
-            Some((
-                "text/parameters",
-                format!(
-                    "volume: {:.1}",
-                    if cfg.quiet_mode {
-                        -144.0
-                    } else {
-                        cfg.volume_db
-                    }
-                )
-                .into_bytes(),
-            )),
-        )
-        .await?;
+        if let Err(error) = conn
+            .request(
+                false,
+                "SET_PARAMETER",
+                &uri,
+                &[],
+                Some((
+                    "text/parameters",
+                    format!(
+                        "volume: {:.1}",
+                        if cfg.quiet_mode {
+                            -144.0
+                        } else {
+                            cfg.volume_db
+                        }
+                    )
+                    .into_bytes(),
+                )),
+            )
+            .await
+        {
+            if !is_volume_server_error(&error) {
+                return Err(error);
+            }
+            warn!(
+                "Receiver returned 500 to initial volume change; continuing stream setup: {error}"
+            );
+        }
         if cfg.initial_progress {
             conn.request(
                 false,
@@ -1117,7 +1132,8 @@ impl Ap2Session {
         }
         let uri = self.uri.clone();
         let body = format!("volume: {:.1}", volume_db.clamp(-144.0, 0.0)).into_bytes();
-        self.conn
+        match self
+            .conn
             .request(
                 false,
                 "SET_PARAMETER",
@@ -1126,7 +1142,14 @@ impl Ap2Session {
                 Some(("text/parameters", body)),
             )
             .await
-            .map(|_| ())
+        {
+            Ok(_) => Ok(()),
+            Err(error) if is_volume_server_error(&error) => {
+                warn!("Receiver returned 500 to volume change; keeping stream active: {error}");
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// Sends `POST /feedback` (keep-alive, pyatv every 2 s).

@@ -1137,6 +1137,7 @@ impl Ap2Session {
         ring_capacity: usize,
     ) -> Result<Self, Ap2Error> {
         let source_is_live = source.is_live();
+        let prefill_ms = cfg.prefill_ms;
         let (producer, mut consumer) =
             rtrb::RingBuffer::<[i16; SAMPLES_PER_PACKET]>::new(ring_capacity);
         let feeder_stop = Arc::new(AtomicBool::new(false));
@@ -1170,6 +1171,19 @@ impl Ap2Session {
                 // Pairing and RTSP setup can take seconds. Starting capture
                 // before them fills the ring with stale live audio, which is
                 // then dropped in a burst at packet zero.
+                if live {
+                    // Start live capture just before the first network send.
+                    // This leaves enough fresh PCM to prime the packetizer
+                    // without filling the ring while the receiver arms itself.
+                    let prime_before_send = Duration::from_millis(80);
+                    let feeder_at = s
+                        .start_instant()
+                        .checked_sub(Duration::from_millis(prefill_ms as u64) + prime_before_send)
+                        .unwrap_or_else(Instant::now);
+                    if feeder_at > Instant::now() {
+                        tokio::time::sleep_until(tokio::time::Instant::from_std(feeder_at)).await;
+                    }
+                }
                 match pipeline::start_pipeline_feeder(
                     source,
                     producer,

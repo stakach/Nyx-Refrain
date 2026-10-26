@@ -6,7 +6,7 @@ use std::sync::atomic::Ordering::Relaxed;
 use std::time::Duration;
 
 use capture::AudioSource;
-use raop::ap2::session::{Ap2Config, Ap2Error, Ap2Session, MIN_SYNC_LATENCY_MS};
+use raop::ap2::session::{Ap2AudioCodec, Ap2Config, Ap2Error, Ap2Session, MIN_SYNC_LATENCY_MS};
 use tokio::io::AsyncBufReadExt;
 use tracing::{info, warn};
 
@@ -67,6 +67,8 @@ pub struct Ap2Run {
     pub features: Option<String>,
     /// Send the placeholder `progress` before RECORD (see `Ap2Config::initial_progress`).
     pub initial_progress: bool,
+    pub compressed_alac: bool,
+    pub start_lead_ms: u32,
     /// Fixed track info (title, artist, album) sent once after the session starts.
     pub static_track: Option<raop::ap2::metadata::TrackInfo>,
     #[cfg(target_os = "linux")]
@@ -84,6 +86,12 @@ pub async fn run_ap2(run: Ap2Run, source: Box<dyn AudioSource + Send>) -> Result
         quiet_mode: run.quiet,
         transcript: run.transcript.clone(),
         initial_progress: run.initial_progress,
+        codec: if run.compressed_alac {
+            Ap2AudioCodec::AlacCompressed
+        } else {
+            Ap2AudioCodec::Alac
+        },
+        start_lead_ms: run.start_lead_ms,
         ..Default::default()
     };
     let ring = pipeline::DEFAULT_RING_BUFFER_PACKETS;

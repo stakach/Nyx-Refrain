@@ -13,6 +13,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use alac_encoder::{AlacEncoder, FormatDescription};
 use plist::{Dictionary, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -40,7 +41,7 @@ pub const FRAMES_PER_PACKET: usize = 352;
 /// Interleaved stereo samples per packet.
 pub const SAMPLES_PER_PACKET: usize = FRAMES_PER_PACKET * 2;
 const PCM_BYTES: usize = SAMPLES_PER_PACKET * 2;
-const MAX_AUDIO_BYTES: usize = alac::FRAME_BYTES;
+const MAX_AUDIO_BYTES: usize = alac::FRAME_BYTES + 1;
 const SAMPLE_RATE: u64 = 44_100;
 
 // Source: pyatv airplayv2.py HEADERS / support/rtsp.py USER_AGENT.
@@ -118,6 +119,9 @@ pub struct Ap2Config {
     pub codec: Ap2AudioCodec,
     /// Send packets this far ahead of their nominal time (burst at start).
     pub prefill_ms: u32,
+    /// Delay between stream SETUP and the nominal first audio packet.
+    /// Third-party receivers may need a longer lead than HomePods.
+    pub start_lead_ms: u32,
     /// Bytes 2..3 of sync packets (0x0007 iTunes / 0x0004 AirPlay).
     pub sync_flag: SyncFlag,
     /// Night/safety mode: force `volume: -144` and clamp samples above -60 dBFS (counted as
@@ -134,6 +138,7 @@ pub struct Ap2Config {
 pub enum Ap2AudioCodec {
     Pcm,
     Alac,
+    AlacCompressed,
 }
 
 /// Keep up to roughly 96 ms of live capture to absorb Windows USB scheduling
@@ -155,6 +160,7 @@ impl Default for Ap2Config {
             volume_db: -144.0,
             codec: Ap2AudioCodec::Alac,
             prefill_ms: 0,
+            start_lead_ms: 1_000,
             sync_flag: SyncFlag::ITunes,
             quiet_mode: true,
             transcript: None,
@@ -818,7 +824,7 @@ impl Ap2Session {
             "audioFormat".into(),
             int(match cfg.codec {
                 Ap2AudioCodec::Pcm => 0x800,
-                Ap2AudioCodec::Alac => 0x40000,
+                Ap2AudioCodec::Alac | Ap2AudioCodec::AlacCompressed => 0x40000,
             }),
         );
         s.insert("audioMode".into(), Value::String("default".into()));
@@ -830,7 +836,7 @@ impl Ap2Session {
             "ct".into(),
             int(match cfg.codec {
                 Ap2AudioCodec::Pcm => 1,
-                Ap2AudioCodec::Alac => 2,
+                Ap2AudioCodec::Alac | Ap2AudioCodec::AlacCompressed => 2,
             }),
         );
         s.insert("isMedia".into(), Value::Boolean(true));
@@ -875,7 +881,7 @@ impl Ap2Session {
         let seq0: u16 = rand::random();
         // RECORD and FLUSH still need round trips. Leave enough lead time for
         // third-party receivers to arm their playout clock before packet zero.
-        let start_at = Instant::now() + Duration::from_secs(1);
+        let start_at = Instant::now() + Duration::from_millis(cfg.start_lead_ms as u64);
         let rtp0 = clock.rtp_ts(start_at);
         let rtp_info = format!("seq={seq0};rtptime={rtp0}");
 
@@ -1034,6 +1040,11 @@ impl Ap2Session {
                     let mut payload = [0u8; MAX_AUDIO_BYTES];
                     let mut header = [0u8; 12];
                     let mut packet = [0u8; 12 + MAX_AUDIO_BYTES + AUDIO_TRAILER_LEN];
+                    let pcm_format = FormatDescription::pcm::<i16>(44_100.0, 2);
+                    let alac_format =
+                        FormatDescription::alac(44_100.0, FRAMES_PER_PACKET as u32, 2);
+                    let mut encoder = AlacEncoder::new(&alac_format);
+                    let mut pcm_bytes = [0u8; PCM_BYTES];
                     // AirPlay 2 receivers associate RTP audio with the RTSP
                     // streamConnectionID. Some third-party receivers silently
                     // discard packets when the SSRC differs from that ID.
@@ -1062,6 +1073,13 @@ impl Ap2Session {
                             Ap2AudioCodec::Alac => {
                                 alac::encode_uncompressed(&pcm, &mut payload);
                                 alac::FRAME_BYTES
+                            }
+                            Ap2AudioCodec::AlacCompressed => {
+                                for (sample, bytes) in pcm.iter().zip(pcm_bytes.chunks_exact_mut(2))
+                                {
+                                    bytes.copy_from_slice(&sample.to_le_bytes());
+                                }
+                                encoder.encode(&pcm_format, &pcm_bytes, &mut payload)
                             }
                         };
                         let seq = seq0.wrapping_add(idx as u16);

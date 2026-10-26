@@ -49,6 +49,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "alac-encoder"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0a32a4e6eec2ede679898711c25120685f4cd472be57be0b98642312232b9f29"
+dependencies = [
+ "log",
+]
+
+[[package]]
 name = "android-activity"
 version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2740,6 +2749,7 @@ dependencies = [
 name = "raop"
 version = "0.9.4"
 dependencies = [
+ "alac-encoder",
  "capture",
  "chacha20poly1305",
  "hkdf",

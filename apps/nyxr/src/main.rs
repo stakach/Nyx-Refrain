@@ -97,6 +97,14 @@ enum Commands {
         #[arg(long)]
         initial_progress: bool,
 
+        /// Use compressed ALAC for AirPlay 2 (experimental)
+        #[arg(long, hide = true)]
+        compressed_alac: bool,
+
+        /// Milliseconds between stream setup and the first audio packet
+        #[arg(long, default_value_t = 1000, hide = true)]
+        ap2_start_lead_ms: u32,
+
         /// AirPlay 2 latency preset: low ≈97 ms, balanced ≈137 ms, stable ≈237 ms end-to-end
         #[arg(long, value_enum, default_value_t = ap2run::LatencyProfile::Balanced)]
         latency_profile: ap2run::LatencyProfile,
@@ -203,6 +211,14 @@ enum Commands {
         /// AirPlay 2: send the placeholder `progress` (1 hour) before RECORD (opt-in escape hatch)
         #[arg(long)]
         initial_progress: bool,
+
+        /// Use compressed ALAC for AirPlay 2 (experimental)
+        #[arg(long, hide = true)]
+        compressed_alac: bool,
+
+        /// Milliseconds between stream setup and the first audio packet
+        #[arg(long, default_value_t = 1000, hide = true)]
+        ap2_start_lead_ms: u32,
 
         /// Experiment: read AP2 requests to send from stdin while streaming (type `help`)
         #[arg(long, hide = true)]
@@ -597,6 +613,8 @@ async fn main() -> anyhow::Result<()> {
             no_remote_control,
             debug_stdin,
             initial_progress,
+            compressed_alac,
+            ap2_start_lead_ms,
             latency_profile,
             ap2_sync_latency_ms,
             config: config_path,
@@ -669,6 +687,8 @@ async fn main() -> anyhow::Result<()> {
                 debug_stdin,
                 features: target_features,
                 initial_progress,
+                compressed_alac,
+                start_lead_ms: ap2_start_lead_ms,
                 static_track: None,
                 #[cfg(target_os = "linux")]
                 volume_control: vol_ctrl,
@@ -810,6 +830,8 @@ async fn main() -> anyhow::Result<()> {
             volume,
             stats,
             initial_progress,
+            compressed_alac,
+            ap2_start_lead_ms,
             debug_stdin,
             track_title,
             track_artist,
@@ -862,6 +884,8 @@ async fn main() -> anyhow::Result<()> {
                 debug_stdin,
                 features: None,
                 initial_progress,
+                compressed_alac,
+                start_lead_ms: ap2_start_lead_ms,
                 static_track: track_title
                     .as_deref()
                     .map(|t| raop::ap2::metadata::TrackInfo::new(t, &track_artist, &track_album)),

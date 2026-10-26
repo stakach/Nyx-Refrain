@@ -8,7 +8,9 @@
 pub const PCM_SAMPLES: usize = 352 * 2;
 pub const FRAME_BYTES: usize = (23 + PCM_SAMPLES * 16 + 3).div_ceil(8);
 
-pub fn encode_uncompressed(pcm: &[i16; PCM_SAMPLES], out: &mut [u8; FRAME_BYTES]) {
+pub fn encode_uncompressed(pcm: &[i16; PCM_SAMPLES], out: &mut [u8]) {
+    assert!(out.len() >= FRAME_BYTES);
+    let out = &mut out[..FRAME_BYTES];
     out.fill(0);
     // 001, nineteen zero bits, then 1.
     out[0] = 0x20;

@@ -36,6 +36,7 @@ pub struct PipelineProcessor {
     drift: DriftCompensator,
     dither: TpdfDither,
     underrun_timeout: Duration,
+    synthesize_timestamp_gaps: bool,
     last_chunk_time: Option<Instant>,
     downmix_buf: Vec<f32>,
     resampled_f32: Vec<f32>,
@@ -69,12 +70,19 @@ impl PipelineProcessor {
             dither: TpdfDither::default(),
             underrun_timeout: underrun_timeout
                 .unwrap_or(Duration::from_millis(DEFAULT_UNDERRUN_TIMEOUT_MS)),
+            synthesize_timestamp_gaps: true,
             last_chunk_time: None,
             downmix_buf: Vec::with_capacity(1024),
             resampled_f32: Vec::with_capacity(1024),
             staging_s16: Vec::with_capacity(ALAC_PCM_SAMPLES * 4),
             metrics,
         })
+    }
+
+    /// Live sources can deliver queued audio late without losing samples. Their
+    /// read timestamp is not a capture clock, so do not insert silence for it.
+    pub fn set_synthesize_timestamp_gaps(&mut self, enabled: bool) {
+        self.synthesize_timestamp_gaps = enabled;
     }
 
     /// Reset internal state.
@@ -103,7 +111,7 @@ impl PipelineProcessor {
             && now > last_time
         {
             let gap = now.duration_since(last_time);
-            if gap >= self.underrun_timeout {
+            if self.synthesize_timestamp_gaps && gap >= self.underrun_timeout {
                 self.metrics.record_discontinuity();
                 // Synthesize silence for the missing duration
                 let gap_frames =
@@ -230,6 +238,7 @@ pub fn start_pipeline_feeder(
             if source.is_live() {
                 // Live capture: the sender trims above 12 packets, so steer to 6.
                 processor.set_target_fill_level(LIVE_TARGET_FILL_PACKETS);
+                processor.set_synthesize_timestamp_gaps(false);
             }
             let _ = source.start();
             let mut packets_batch = Vec::with_capacity(8);
@@ -354,6 +363,32 @@ mod tests {
         assert!(
             snap.capture_discontinuities > 0,
             "Underrun should have been detected"
+        );
+    }
+
+    #[test]
+    fn live_source_does_not_invent_silence_after_late_queue_read() {
+        let metrics = Arc::new(PipelineMetricsTracker::new(DEFAULT_RING_BUFFER_PACKETS));
+        let mut proc = PipelineProcessor::new(44100, metrics.clone(), None).unwrap();
+        proc.set_synthesize_timestamp_gaps(false);
+        let now = Instant::now();
+        let mut packets = Vec::new();
+        proc.process_chunk(
+            &AudioChunk::new(vec![0.5; 882], 44100, 2, now),
+            6,
+            &mut packets,
+        )
+        .unwrap();
+        proc.process_chunk(
+            &AudioChunk::new(vec![0.5; 882], 44100, 2, now + Duration::from_millis(100)),
+            6,
+            &mut packets,
+        )
+        .unwrap();
+        assert_eq!(metrics.snapshot().capture_discontinuities, 0);
+        assert!(
+            packets.len() <= 3,
+            "a late read must not create 100 ms of silence"
         );
     }
 

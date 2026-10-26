@@ -974,6 +974,9 @@ impl Ap2Session {
                         } else {
                             Instant::now()
                         };
+                        let startup_refresh = start_at
+                            .checked_sub(prefill + Duration::from_millis(100))
+                            .unwrap_or(start_at);
                         while !stop.load(Ordering::Relaxed) {
                             let now = Instant::now();
                             if now >= next {
@@ -988,8 +991,15 @@ impl Ap2Session {
                                     &mut out,
                                 );
                                 let _ = sock.send_to(&out, remote_ctrl);
+                                let was_first = first;
                                 first = false;
-                                next = now + Duration::from_secs(1);
+                                next = if was_first && !prefill.is_zero() && startup_refresh > now {
+                                    // Refresh the mapping before packet zero;
+                                    // recv_from may wake up to 50 ms late.
+                                    startup_refresh
+                                } else {
+                                    now + Duration::from_secs(1)
+                                };
                             }
                             if let Ok((n, from)) = sock.recv_from(&mut buf) {
                                 let c = stats

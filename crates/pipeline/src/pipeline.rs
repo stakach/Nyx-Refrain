@@ -25,8 +25,8 @@ pub const DEFAULT_UNDERRUN_TIMEOUT_MS: u64 = 50;
 pub const DEFAULT_RING_BUFFER_PACKETS: usize = 32;
 
 /// Target ring fill (packets) for live sources; must stay well below the sender's backlog cap
-/// (`raop::ap2::session::LIVE_MAX_BUFFERED_PACKETS` = 6) so chunk-granularity peaks never trim.
-pub const LIVE_TARGET_FILL_PACKETS: usize = 3;
+/// (`raop::ap2::session::LIVE_MAX_BUFFERED_PACKETS` = 12) so chunk-granularity peaks never trim.
+pub const LIVE_TARGET_FILL_PACKETS: usize = 6;
 
 /// Core processing engine that converts, resamples, compensates drift, dithers,
 /// and slices audio into strict 352-frame packets.
@@ -228,7 +228,7 @@ pub fn start_pipeline_feeder(
             };
 
             if source.is_live() {
-                // Live capture: the sender trims above 6 packets, so steer to 3.
+                // Live capture: the sender trims above 12 packets, so steer to 6.
                 processor.set_target_fill_level(LIVE_TARGET_FILL_PACKETS);
             }
             let _ = source.start();

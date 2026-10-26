@@ -1,6 +1,7 @@
 //! AirPlay 2 sender support (realtime audio, type 0x60) for receivers such as HomePods on
 //! tvOS versions that no longer play AirPlay 1 audio.
 
+pub mod alac;
 pub mod audio;
 pub mod hap;
 pub mod history;

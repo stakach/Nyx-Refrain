@@ -18,6 +18,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tracing::{debug, info, warn};
 
+use super::alac;
 use super::audio::{AUDIO_TRAILER_LEN, AudioCipher};
 use super::hap::{self, HapSession};
 use super::metadata::{
@@ -39,6 +40,7 @@ pub const FRAMES_PER_PACKET: usize = 352;
 /// Interleaved stereo samples per packet.
 pub const SAMPLES_PER_PACKET: usize = FRAMES_PER_PACKET * 2;
 const PCM_BYTES: usize = SAMPLES_PER_PACKET * 2;
+const MAX_AUDIO_BYTES: usize = alac::FRAME_BYTES;
 const SAMPLE_RATE: u64 = 44_100;
 
 // Source: pyatv airplayv2.py HEADERS / support/rtsp.py USER_AGENT.
@@ -111,6 +113,9 @@ pub struct Ap2Config {
     pub latency_max: u32,
     /// `volume: <dB>` (-30..0, -144 = mute) sent before audio.
     pub volume_db: f32,
+    /// Audio payload format. ALAC also carries uncompressed PCM samples, but
+    /// some third-party receivers only render audio with ALAC framing.
+    pub codec: Ap2AudioCodec,
     /// Send packets this far ahead of their nominal time (burst at start).
     pub prefill_ms: u32,
     /// Bytes 2..3 of sync packets (0x0007 iTunes / 0x0004 AirPlay).
@@ -125,10 +130,15 @@ pub struct Ap2Config {
     pub initial_progress: bool,
 }
 
-/// For live sources, packets buffered between capture pipeline and sender beyond this are
-/// dropped (6 packets ≈ 48 ms; the pipeline steers the fill to 3, WASAPI delivers ~10 ms
-/// chunks ≈ 1.25 packets, so normal peaks stay below the cap).
-pub const LIVE_MAX_BUFFERED_PACKETS: usize = 6;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ap2AudioCodec {
+    Pcm,
+    Alac,
+}
+
+/// Keep up to roughly 96 ms of live capture to absorb Windows USB scheduling
+/// and Wi-Fi jitter. Larger backlogs are dropped so latency stays bounded.
+pub const LIVE_MAX_BUFFERED_PACKETS: usize = 12;
 
 /// Lowest sync latency accepted (verified clean in receiver testing).
 pub const MIN_SYNC_LATENCY_MS: i32 = -165;
@@ -143,6 +153,7 @@ impl Default for Ap2Config {
             latency_min: 11_025,
             latency_max: 88_200,
             volume_db: -144.0,
+            codec: Ap2AudioCodec::Alac,
             prefill_ms: 0,
             sync_flag: SyncFlag::ITunes,
             quiet_mode: true,
@@ -156,6 +167,7 @@ impl Default for Ap2Config {
 #[derive(Debug, Default)]
 pub struct Ap2Stats {
     pub packets_sent: AtomicU64,
+    pub audio_send_errors: AtomicU64,
     pub timing_requests: AtomicU64,
     pub control_packets_received: AtomicU64,
     pub event_requests: AtomicU64,
@@ -802,13 +814,25 @@ impl Ap2Session {
         // SETUP #2 (realtime audio stream).
         let shk: [u8; 32] = rand::random();
         let mut s = Dictionary::new();
-        s.insert("audioFormat".into(), int(0x800)); // PCM/44100/16/2
+        s.insert(
+            "audioFormat".into(),
+            int(match cfg.codec {
+                Ap2AudioCodec::Pcm => 0x800,
+                Ap2AudioCodec::Alac => 0x40000,
+            }),
+        );
         s.insert("audioMode".into(), Value::String("default".into()));
         s.insert(
             "controlPort".into(),
             int(control_sock.local_addr()?.port() as u64),
         );
-        s.insert("ct".into(), int(1)); // raw PCM
+        s.insert(
+            "ct".into(),
+            int(match cfg.codec {
+                Ap2AudioCodec::Pcm => 1,
+                Ap2AudioCodec::Alac => 2,
+            }),
+        );
         s.insert("isMedia".into(), Value::Boolean(true));
         s.insert("latencyMax".into(), int(cfg.latency_max as u64));
         s.insert("latencyMin".into(), int(cfg.latency_min as u64));
@@ -1004,10 +1028,13 @@ impl Ap2Session {
                     let _priority = capture::enter_audio_thread_priority();
                     let mut cipher = AudioCipher::new(&shk);
                     let mut pcm = [0i16; SAMPLES_PER_PACKET];
-                    let mut payload = [0u8; PCM_BYTES];
+                    let mut payload = [0u8; MAX_AUDIO_BYTES];
                     let mut header = [0u8; 12];
-                    let mut packet = [0u8; 12 + PCM_BYTES + AUDIO_TRAILER_LEN];
-                    let ssrc: u32 = rand::random();
+                    let mut packet = [0u8; 12 + MAX_AUDIO_BYTES + AUDIO_TRAILER_LEN];
+                    // AirPlay 2 receivers associate RTP audio with the RTSP
+                    // streamConnectionID. Some third-party receivers silently
+                    // discard packets when the SSRC differs from that ID.
+                    let ssrc = session_id;
                     let mut idx: u64 = 0;
                     while !stop.load(Ordering::Relaxed) {
                         let nominal = start_at
@@ -1022,16 +1049,31 @@ impl Ap2Session {
                         }
                         source(&mut pcm);
                         guard.process_s16(&mut pcm);
-                        for (i, s) in pcm.iter().enumerate() {
-                            payload[2 * i..2 * i + 2].copy_from_slice(&s.to_be_bytes());
-                        }
+                        let payload_len = match cfg.codec {
+                            Ap2AudioCodec::Pcm => {
+                                for (i, s) in pcm.iter().enumerate() {
+                                    payload[2 * i..2 * i + 2].copy_from_slice(&s.to_be_bytes());
+                                }
+                                PCM_BYTES
+                            }
+                            Ap2AudioCodec::Alac => {
+                                alac::encode_uncompressed(&pcm, &mut payload);
+                                alac::FRAME_BYTES
+                            }
+                        };
                         let seq = seq0.wrapping_add(idx as u16);
                         let ts = rtp0.wrapping_add((idx * FRAMES_PER_PACKET as u64) as u32);
                         write_rtp_header(idx == 0, seq, ts, ssrc, &mut header);
-                        let n = cipher.seal(&header, &payload, &mut packet);
+                        let n = cipher.seal(&header, &payload[..payload_len], &mut packet);
                         history.insert(seq, &packet[..n]);
-                        let _ = audio_sock.send_to(&packet[..n], remote_audio);
-                        stats.packets_sent.fetch_add(1, Ordering::Relaxed);
+                        match audio_sock.send_to(&packet[..n], remote_audio) {
+                            Ok(_) => {
+                                stats.packets_sent.fetch_add(1, Ordering::Relaxed);
+                            }
+                            Err(_) => {
+                                stats.audio_send_errors.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
                         idx += 1;
                     }
                 },

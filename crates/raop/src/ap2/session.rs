@@ -141,9 +141,30 @@ pub enum Ap2AudioCodec {
     AlacCompressed,
 }
 
-/// Keep up to roughly 96 ms of live capture to absorb Windows USB scheduling
-/// and Wi-Fi jitter. Larger backlogs are dropped so latency stays bounded.
+/// Keep roughly 96 ms of live capture by default. A sender configured to
+/// transmit further ahead needs a matching capture backlog.
 pub const LIVE_MAX_BUFFERED_PACKETS: usize = 12;
+
+fn live_buffer_limit(prefill_ms: u32, ring_capacity: usize) -> usize {
+    let prefill_frames = prefill_ms as usize * SAMPLE_RATE as usize / 1_000;
+    let prefill_packets = prefill_frames.div_ceil(FRAMES_PER_PACKET);
+    LIVE_MAX_BUFFERED_PACKETS
+        .max(prefill_packets.saturating_add(2))
+        .min(ring_capacity.saturating_sub(1))
+}
+
+#[cfg(test)]
+mod live_buffer_tests {
+    use super::*;
+
+    #[test]
+    fn prefill_retains_enough_live_capture_without_exceeding_ring() {
+        assert_eq!(live_buffer_limit(0, 32), 12);
+        assert_eq!(live_buffer_limit(100, 32), 15);
+        assert_eq!(live_buffer_limit(200, 32), 28);
+        assert_eq!(live_buffer_limit(1_000, 32), 31);
+    }
+}
 
 /// Lowest sync latency accepted (verified clean in receiver testing).
 pub const MIN_SYNC_LATENCY_MS: i32 = -165;
@@ -1149,12 +1170,13 @@ impl Ap2Session {
         )?;
         let rt_metrics = metrics.clone();
         let live = source_is_live;
+        let max_buffered = live_buffer_limit(cfg.prefill_ms, ring_capacity);
         let started = Self::start(cfg, move |pcm: &mut [i16; SAMPLES_PER_PACKET]| {
             if live {
-                // Keep latency bounded: drop backlog beyond a few packets (see
-                // AudioSource::is_live). No allocation, no locks.
+                // Keep latency bounded while retaining the packets needed for
+                // configured network prefill. No allocation or locks.
                 let mut dropped = 0u64;
-                while consumer.slots() > LIVE_MAX_BUFFERED_PACKETS {
+                while consumer.slots() > max_buffered {
                     let _ = consumer.pop();
                     dropped += 1;
                 }

@@ -873,7 +873,9 @@ impl Ap2Session {
         let remote_ctrl = SocketAddr::new(cfg.target.ip(), remote_control);
 
         let seq0: u16 = rand::random();
-        let start_at = Instant::now() + Duration::from_millis(150);
+        // RECORD and FLUSH still need round trips. Leave enough lead time for
+        // third-party receivers to arm their playout clock before packet zero.
+        let start_at = Instant::now() + Duration::from_secs(1);
         let rtp0 = clock.rtp_ts(start_at);
         let rtp_info = format!("seq={seq0};rtptime={rtp0}");
 
@@ -960,13 +962,14 @@ impl Ap2Session {
                         while !stop.load(Ordering::Relaxed) {
                             let now = Instant::now();
                             if now >= next {
-                                let rtp_now = clock.rtp_ts(now.max(start_at));
+                                let sync_at = now.max(start_at);
+                                let rtp_now = clock.rtp_ts(sync_at);
                                 build_sync_packet(
                                     first,
                                     sync_flag,
                                     rtp_now,
                                     latency,
-                                    clock.ntp_at(now).to_u64(),
+                                    clock.ntp_at(sync_at).to_u64(),
                                     &mut out,
                                 );
                                 let _ = sock.send_to(&out, remote_ctrl);

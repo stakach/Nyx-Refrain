@@ -965,9 +965,15 @@ impl Ap2Session {
                         let mut pkt = [0u8; super::history::MAX_PACKET];
                         let mut resp = [0u8; 4 + super::history::MAX_PACKET];
                         let mut first = true;
-                        // Announce the playback clock before early audio packets
-                        // arrive; both still refer to the same start_at timeline.
-                        let mut next = start_at.checked_sub(prefill).unwrap_or(start_at);
+                        // Live audio is sent before its playout timestamp. Send
+                        // the initial clock mapping as soon as setup completes,
+                        // rather than racing the first audio packet. Both sync
+                        // and audio still refer to the same start_at timeline.
+                        let mut next = if prefill.is_zero() {
+                            start_at
+                        } else {
+                            Instant::now()
+                        };
                         while !stop.load(Ordering::Relaxed) {
                             let now = Instant::now();
                             if now >= next {

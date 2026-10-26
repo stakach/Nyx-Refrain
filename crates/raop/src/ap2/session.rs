@@ -77,6 +77,24 @@ fn is_volume_server_error(error: &Ap2Error) -> bool {
     matches!(error, Ap2Error::Status { method, status: 500, .. } if method == "SET_PARAMETER")
 }
 
+#[cfg(test)]
+mod volume_error_tests {
+    use super::*;
+
+    #[test]
+    fn only_receiver_server_error_on_volume_is_nonfatal() {
+        let response = |method: &str, status| Ap2Error::Status {
+            method: method.into(),
+            uri: "rtsp://receiver/session".into(),
+            status,
+            reason: "failure".into(),
+        };
+        assert!(is_volume_server_error(&response("SET_PARAMETER", 500)));
+        assert!(!is_volume_server_error(&response("SET_PARAMETER", 401)));
+        assert!(!is_volume_server_error(&response("SETUP", 500)));
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Ap2Config {
     pub target: SocketAddr,

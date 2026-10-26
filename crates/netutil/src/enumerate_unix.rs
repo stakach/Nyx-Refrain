@@ -54,7 +54,7 @@ pub fn enumerate_interfaces_unix() -> std::io::Result<Vec<InterfaceInfo>> {
 
             // Check if this record is IPv4 (AF_INET)
             if !ifa.ifa_addr.is_null()
-                && unsafe { (*ifa.ifa_addr).sa_family } == libc::AF_INET as u16
+                && i32::from(unsafe { (*ifa.ifa_addr).sa_family }) == libc::AF_INET
             {
                 let sa_in = unsafe { &*(ifa.ifa_addr as *const libc::sockaddr_in) };
                 let ip = Ipv4Addr::from(u32::from_be(sa_in.sin_addr.s_addr));

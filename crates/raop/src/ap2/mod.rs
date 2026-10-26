@@ -9,7 +9,6 @@ pub mod buffered;
 pub mod hap;
 pub mod history;
 pub mod metadata;
-pub mod ptp;
 pub mod remote;
 pub mod session;
 pub mod srp;

@@ -19,17 +19,12 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tracing::{debug, info, warn};
 
-#[cfg(any(target_os = "macos", windows))]
-use super::aac;
 use super::alac;
 use super::audio::{AUDIO_TRAILER_LEN, AudioCipher};
-#[cfg(any(target_os = "macos", windows))]
-use super::buffered;
 use super::hap::{self, HapSession};
 use super::metadata::{
     Ap2Features, TrackInfo, encode_dmap, format_progress_body, sniff_image_type,
 };
-use super::ptp::{PtpClock, PtpPeerLease};
 use super::remote::{self, Command as RemoteCommand};
 use super::srp;
 use super::tlv8::{self, tag};
@@ -103,29 +98,6 @@ mod volume_error_tests {
     }
 }
 
-#[cfg(test)]
-mod buffered_setup_tests {
-    use super::*;
-
-    #[test]
-    fn rate_anchor_round_trips_signed_clock_and_fraction() {
-        let clock_id = 0xacbc_b516_156d_0008;
-        let anchor_ns = 1_034_110_750_000_000u64;
-        let encoded = bplist(rate_anchor(clock_id, anchor_ns, 0xf123_4567)).unwrap();
-        let decoded = parse_plist(&encoded).unwrap();
-        assert_eq!(
-            decoded["networkTimeTimelineID"].as_signed_integer(),
-            Some(clock_id as i64)
-        );
-        assert_eq!(
-            decoded["networkTimeSecs"].as_unsigned_integer(),
-            Some(anchor_ns / 1_000_000_000)
-        );
-        assert_eq!(decoded["rtpTime"].as_unsigned_integer(), Some(0xf123_4567));
-        assert_eq!(decoded["rate"].as_unsigned_integer(), Some(1));
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct Ap2Config {
     pub target: SocketAddr,
@@ -167,9 +139,6 @@ pub enum Ap2AudioCodec {
     Pcm,
     Alac,
     AlacCompressed,
-    /// AAC-LC over the AirPlay 2 buffered TCP stream (requires PTP).
-    #[cfg(any(target_os = "macos", windows))]
-    AacLc,
 }
 
 /// Keep up to roughly 96 ms of live capture to absorb Windows USB scheduling
@@ -392,39 +361,6 @@ fn int(v: u64) -> Value {
     Value::Integer(v.into())
 }
 
-fn ptp_peer_info(id: &str, clock_id: u64, address: Ipv4Addr) -> Value {
-    let mut peer = Dictionary::new();
-    peer.insert("ID".into(), Value::String(id.into()));
-    peer.insert("DeviceType".into(), int(0));
-    peer.insert("ClockID".into(), Value::Integer((clock_id as i64).into()));
-    peer.insert(
-        "SupportsClockPortMatchingOverride".into(),
-        Value::Boolean(false),
-    );
-    peer.insert(
-        "Addresses".into(),
-        Value::Array(vec![Value::String(address.to_string())]),
-    );
-    Value::Dictionary(peer)
-}
-
-fn rate_anchor(clock_id: u64, timestamp_ns: u64, rtp_time: u32) -> Dictionary {
-    let mut anchor = Dictionary::new();
-    anchor.insert(
-        "networkTimeTimelineID".into(),
-        Value::Integer((clock_id as i64).into()),
-    );
-    anchor.insert("networkTimeSecs".into(), int(timestamp_ns / 1_000_000_000));
-    let fractional = ((timestamp_ns % 1_000_000_000) as u128 * (1u128 << 64)) / 1_000_000_000u128;
-    anchor.insert(
-        "networkTimeFrac".into(),
-        Value::Integer((fractional as u64 as i64).into()),
-    );
-    anchor.insert("rtpTime".into(), int(rtp_time as u64));
-    anchor.insert("rate".into(), int(1));
-    anchor
-}
-
 fn random_uuid_upper() -> String {
     let b: [u8; 16] = rand::random();
     format!(
@@ -644,13 +580,12 @@ pub struct Ap2Session {
     progress_disabled: bool,
     last_artwork_hash: Option<u64>,
     remote_commands: Option<tokio::sync::mpsc::Receiver<RemoteCommand>>,
-    _ptp_lease: Option<PtpPeerLease>,
 }
 
 impl Ap2Session {
     /// Pairs, sets up and starts streaming PCM produced by `source` (called once per
     /// 352-frame packet on the sender thread; must not block).
-    pub async fn start<F>(cfg: Ap2Config, source: F) -> Result<Self, Ap2Error>
+    pub async fn start<F>(cfg: Ap2Config, mut source: F) -> Result<Self, Ap2Error>
     where
         F: FnMut(&mut [i16; SAMPLES_PER_PACKET]) + Send + 'static,
     {
@@ -776,28 +711,10 @@ impl Ap2Session {
         let control_sock = bind_udp()?;
         let audio_sock = bind_udp()?;
         let clock = Clock::init();
-        #[cfg(any(target_os = "macos", windows))]
-        let buffered_audio = cfg.codec == Ap2AudioCodec::AacLc;
-        #[cfg(not(any(target_os = "macos", windows)))]
-        let buffered_audio = false;
-        let ptp = if buffered_audio {
-            Some(PtpClock::shared()?)
-        } else {
-            None
-        };
-        let ptp_lease = match (&ptp, cfg.target.ip()) {
-            (Some(ptp), std::net::IpAddr::V4(peer)) => Some(ptp.add_peer(peer)),
-            (Some(_), _) => {
-                return Err(Ap2Error::NotSupported(
-                    "AAC buffered audio currently requires an IPv4 receiver".into(),
-                ));
-            }
-            _ => None,
-        };
 
         let mut threads: Vec<std::thread::JoinHandle<()>> = Vec::new();
         // Timing responder must run before SETUP (the receiver probes during SETUP).
-        if !buffered_audio {
+        {
             let sock = timing_sock.try_clone()?;
             let stop = stop.clone();
             let stats = stats.clone();
@@ -828,53 +745,29 @@ impl Ap2Session {
             );
         }
 
-        // Let a receiver that insists on its own PTP grandmaster advertise its
-        // timeline before SETUP declares the timing peer.
-        if buffered_audio {
-            tokio::time::sleep(Duration::from_millis(1_100)).await;
-        }
-
         // SETUP #1 (session).
         let mut d = Dictionary::new();
         d.insert("deviceID".into(), Value::String("AA:BB:CC:DD:EE:FF".into()));
         d.insert("sessionUUID".into(), Value::String(random_uuid_upper()));
-        if let Some(ptp) = &ptp {
-            d.insert("timingProtocol".into(), Value::String("PTP".into()));
-            let peer_id = random_uuid_upper();
-            let timeline_id = match cfg.target.ip() {
-                std::net::IpAddr::V4(peer) => ptp.advertised_clock_for(peer),
-                _ => ptp.clock_id(),
-            };
-            let peer_info = ptp_peer_info(&peer_id, timeline_id, local_ip);
-            d.insert("timingPeerInfo".into(), peer_info.clone());
-            d.insert("timingPeerList".into(), Value::Array(vec![peer_info]));
-        } else {
-            d.insert(
-                "timingPort".into(),
-                int(timing_sock.local_addr()?.port() as u64),
-            );
-            d.insert("timingProtocol".into(), Value::String("NTP".into()));
-        }
-        if !buffered_audio {
-            d.insert("isMultiSelectAirPlay".into(), Value::Boolean(true));
-        } else {
-            d.insert("groupUUID".into(), Value::String(random_uuid_upper()));
-        }
+        d.insert(
+            "timingPort".into(),
+            int(timing_sock.local_addr()?.port() as u64),
+        );
+        d.insert("timingProtocol".into(), Value::String("NTP".into()));
+        d.insert("isMultiSelectAirPlay".into(), Value::Boolean(true));
         d.insert("groupContainsGroupLeader".into(), Value::Boolean(false));
         d.insert(
             "macAddress".into(),
             Value::String("AA:BB:CC:DD:EE:FF".into()),
         );
+        d.insert("model".into(), Value::String("iPhone14,3".into()));
         d.insert("name".into(), Value::String("Nyx Refrain".into()));
-        if !buffered_audio {
-            d.insert("model".into(), Value::String("iPhone14,3".into()));
-            d.insert("osBuildVersion".into(), Value::String("20F66".into()));
-            d.insert("osName".into(), Value::String("iPhone OS".into()));
-            d.insert("osVersion".into(), Value::String("16.5".into()));
-            d.insert("senderSupportsRelay".into(), Value::Boolean(false));
-            d.insert("sourceVersion".into(), Value::String("690.7.1".into()));
-            d.insert("statsCollectionEnabled".into(), Value::Boolean(false));
-        }
+        d.insert("osBuildVersion".into(), Value::String("20F66".into()));
+        d.insert("osName".into(), Value::String("iPhone OS".into()));
+        d.insert("osVersion".into(), Value::String("16.5".into()));
+        d.insert("senderSupportsRelay".into(), Value::Boolean(false));
+        d.insert("sourceVersion".into(), Value::String("690.7.1".into()));
+        d.insert("statsCollectionEnabled".into(), Value::Boolean(false));
         let r = conn
             .request(
                 false,
@@ -924,7 +817,7 @@ impl Ap2Session {
             }
         }
 
-        // SETUP #2 (realtime UDP or buffered TCP audio stream).
+        // SETUP #2 (realtime audio stream).
         let shk: [u8; 32] = rand::random();
         let mut s = Dictionary::new();
         s.insert(
@@ -932,42 +825,27 @@ impl Ap2Session {
             int(match cfg.codec {
                 Ap2AudioCodec::Pcm => 0x800,
                 Ap2AudioCodec::Alac | Ap2AudioCodec::AlacCompressed => 0x40000,
-                #[cfg(any(target_os = "macos", windows))]
-                Ap2AudioCodec::AacLc => aac::AUDIO_FORMAT,
             }),
         );
         s.insert("audioMode".into(), Value::String("default".into()));
-        if !buffered_audio {
-            s.insert(
-                "controlPort".into(),
-                int(control_sock.local_addr()?.port() as u64),
-            );
-        }
+        s.insert(
+            "controlPort".into(),
+            int(control_sock.local_addr()?.port() as u64),
+        );
         s.insert(
             "ct".into(),
             int(match cfg.codec {
                 Ap2AudioCodec::Pcm => 1,
                 Ap2AudioCodec::Alac | Ap2AudioCodec::AlacCompressed => 2,
-                #[cfg(any(target_os = "macos", windows))]
-                Ap2AudioCodec::AacLc => aac::COMPRESSION_TYPE,
             }),
         );
         s.insert("isMedia".into(), Value::Boolean(true));
-        if !buffered_audio {
-            s.insert("latencyMax".into(), int(cfg.latency_max as u64));
-            s.insert("latencyMin".into(), int(cfg.latency_min as u64));
-        }
+        s.insert("latencyMax".into(), int(cfg.latency_max as u64));
+        s.insert("latencyMin".into(), int(cfg.latency_min as u64));
         s.insert("shk".into(), Value::Data(shk.to_vec()));
-        s.insert(
-            "spf".into(),
-            int(if buffered_audio {
-                1024
-            } else {
-                FRAMES_PER_PACKET
-            } as u64),
-        );
+        s.insert("spf".into(), int(FRAMES_PER_PACKET as u64));
         s.insert("sr".into(), int(SAMPLE_RATE));
-        s.insert("type".into(), int(if buffered_audio { 103 } else { 0x60 }));
+        s.insert("type".into(), int(0x60));
         s.insert("supportsDynamicStreamID".into(), Value::Boolean(false));
         s.insert("streamConnectionID".into(), int(session_id as u64));
         let mut root = Dictionary::new();
@@ -999,50 +877,11 @@ impl Ap2Session {
             .unwrap_or(0) as u16;
         let remote_audio = SocketAddr::new(cfg.target.ip(), data_port);
         let remote_ctrl = SocketAddr::new(cfg.target.ip(), remote_control);
-        if data_port == 0 {
-            return Err(Ap2Error::Plist(
-                "stream SETUP response without dataPort".into(),
-            ));
-        }
-        #[cfg(any(target_os = "macos", windows))]
-        let buffered_socket = if buffered_audio {
-            let socket = TcpStream::connect(remote_audio).await?;
-            socket.set_nodelay(true)?;
-            let socket = socket.into_std()?;
-            socket.set_nonblocking(false)?;
-            socket.set_write_timeout(Some(Duration::from_millis(500)))?;
-            Some(socket)
-        } else {
-            None
-        };
-        if buffered_audio {
-            let peers = Value::Array(vec![
-                Value::String(cfg.target.ip().to_string()),
-                Value::String(local_ip.to_string()),
-            ]);
-            let mut body = Vec::new();
-            peers
-                .to_writer_binary(&mut body)
-                .map_err(|error| Ap2Error::Plist(error.to_string()))?;
-            conn.request(
-                false,
-                "SETPEERS",
-                &uri,
-                &[],
-                Some(("application/x-apple-binary-plist", body)),
-            )
-            .await?;
-        }
 
         let seq0: u16 = rand::random();
         // RECORD and FLUSH still need round trips. Leave enough lead time for
         // third-party receivers to arm their playout clock before packet zero.
-        let mut start_at = Instant::now()
-            + Duration::from_millis(if buffered_audio {
-                cfg.start_lead_ms.max(1_000) as u64
-            } else {
-                cfg.start_lead_ms as u64
-            });
+        let start_at = Instant::now() + Duration::from_millis(cfg.start_lead_ms as u64);
         let rtp0 = clock.rtp_ts(start_at);
         let rtp_info = format!("seq={seq0};rtptime={rtp0}");
 
@@ -1093,69 +932,21 @@ impl Ap2Session {
         }
         conn.request(false, "RECORD", &uri, &[], None).await?;
         conn.request(false, "POST", "/feedback", &[], None).await?;
-        if buffered_audio {
-            let ptp = ptp.as_ref().expect("PTP clock for buffered audio");
-            let peer = match cfg.target.ip() {
-                std::net::IpAddr::V4(peer) => peer,
-                _ => unreachable!("IPv4 checked when PTP lease was created"),
-            };
-            let mut anchored = false;
-            for attempt in 0..12 {
-                let lead = Duration::from_millis(1_000);
-                start_at = Instant::now() + lead;
-                let (timeline_id, timeline_now) = ptp.timeline_for(peer);
-                let anchor_ns = timeline_now + lead.as_nanos() as u64;
-                debug!(
-                    "AAC anchor attempt={} timeline={timeline_id:016x} now={} anchor={}",
-                    attempt + 1,
-                    timeline_now,
-                    anchor_ns
-                );
-                match conn
-                    .request(
-                        false,
-                        "SETRATEANCHORTIME",
-                        &uri,
-                        &[],
-                        Some((
-                            "application/x-apple-binary-plist",
-                            bplist(rate_anchor(timeline_id, anchor_ns, rtp0))?,
-                        )),
-                    )
-                    .await
-                {
-                    Ok(_) => {
-                        anchored = true;
-                        break;
-                    }
-                    Err(Ap2Error::Status { status: 400, .. }) if attempt < 11 => {
-                        tokio::time::sleep(Duration::from_millis(500)).await;
-                    }
-                    Err(error) => return Err(error),
-                }
-            }
-            if !anchored {
-                return Err(Ap2Error::NotSupported(
-                    "receiver did not accept the PTP audio anchor".into(),
-                ));
-            }
-        } else {
-            conn.request(
-                false,
-                "FLUSH",
-                &uri,
-                &[
-                    ("Range", "npt=0-".into()),
-                    ("Session", "0".into()),
-                    ("RTP-Info", rtp_info),
-                ],
-                None,
-            )
-            .await?;
-        }
+        conn.request(
+            false,
+            "FLUSH",
+            &uri,
+            &[
+                ("Range", "npt=0-".into()),
+                ("Session", "0".into()),
+                ("RTP-Info", rtp_info),
+            ],
+            None,
+        )
+        .await?;
 
         // Control: sync packets once per second (first with extension bit), count inbound.
-        if !buffered_audio {
+        {
             let sock = control_sock.try_clone()?;
             let stop = stop.clone();
             let stats = stats.clone();
@@ -1235,14 +1026,12 @@ impl Ap2Session {
         }
 
         // Audio sender (no allocation in the loop).
-        let mut source = Some(source);
-        if !buffered_audio {
+        {
             let stop = stop.clone();
             let stats = stats.clone();
             let prefill = Duration::from_millis(cfg.prefill_ms as u64);
             let history = history.clone();
             let guard = quiet_guard.clone();
-            let mut source = source.take().expect("audio source");
             threads.push(std::thread::Builder::new().name("ap2-audio".into()).spawn(
                 move || {
                     let _priority = capture::enter_audio_thread_priority();
@@ -1292,8 +1081,6 @@ impl Ap2Session {
                                 }
                                 encoder.encode(&pcm_format, &pcm_bytes, &mut payload)
                             }
-                            #[cfg(any(target_os = "macos", windows))]
-                            Ap2AudioCodec::AacLc => unreachable!("AAC uses buffered sender"),
                         };
                         let seq = seq0.wrapping_add(idx as u16);
                         let ts = rtp0.wrapping_add((idx * FRAMES_PER_PACKET as u64) as u32);
@@ -1312,95 +1099,6 @@ impl Ap2Session {
                     }
                 },
             )?);
-        }
-
-        #[cfg(any(target_os = "macos", windows))]
-        if let Some(mut socket) = buffered_socket {
-            let stop = stop.clone();
-            let stats = stats.clone();
-            let guard = quiet_guard.clone();
-            let mut source = source.take().expect("audio source");
-            threads.push(
-                std::thread::Builder::new()
-                    .name("ap2-aac".into())
-                    .spawn(move || {
-                        use std::io::Write;
-                        let _priority = capture::enter_audio_thread_priority();
-                        let mut encoder = match aac::AacLcEncoder::new() {
-                            Ok(encoder) => encoder,
-                            Err(error) => {
-                                warn!("AAC encoder failed to start: {error}");
-                                stats.audio_send_errors.fetch_add(1, Ordering::Relaxed);
-                                return;
-                            }
-                        };
-                        let mut cipher = AudioCipher::new(&shk);
-                        let mut chunk = [0i16; SAMPLES_PER_PACKET];
-                        let mut access_pcm = [0i16; aac::FRAMES_PER_ACCESS_UNIT * 2];
-                        let mut filled = 0usize;
-                        let mut source_index = 0u64;
-                        let mut output_index = 0u64;
-                        while !stop.load(Ordering::Relaxed) {
-                            let due = start_at
-                                + frames_to_duration(
-                                    source_index * FRAMES_PER_PACKET as u64,
-                                    SAMPLE_RATE as u32,
-                                );
-                            let send_at =
-                                due.checked_sub(Duration::from_millis(500)).unwrap_or(due);
-                            if send_at > Instant::now() {
-                                pipeline::wait_until(send_at);
-                            }
-                            source(&mut chunk);
-                            guard.process_s16(&mut chunk);
-                            source_index += 1;
-                            let mut offset = 0;
-                            while offset < chunk.len() {
-                                let count = (access_pcm.len() - filled).min(chunk.len() - offset);
-                                access_pcm[filled..filled + count]
-                                    .copy_from_slice(&chunk[offset..offset + count]);
-                                filled += count;
-                                offset += count;
-                                if filled != access_pcm.len() {
-                                    continue;
-                                }
-                                filled = 0;
-                                let packets = match encoder.encode(&access_pcm) {
-                                    Ok(packets) => packets,
-                                    Err(error) => {
-                                        warn!("AAC encoding failed: {error}");
-                                        stats.audio_send_errors.fetch_add(1, Ordering::Relaxed);
-                                        return;
-                                    }
-                                };
-                                for packet in packets {
-                                    let frame = match buffered::seal_audio_frame(
-                                        &mut cipher,
-                                        output_index == 0,
-                                        seq0.wrapping_add(output_index as u16),
-                                        rtp0.wrapping_add((output_index * 1024) as u32),
-                                        session_id,
-                                        &packet.data,
-                                    ) {
-                                        Ok(frame) => frame,
-                                        Err(error) => {
-                                            warn!("AAC frame failed: {error}");
-                                            stats.audio_send_errors.fetch_add(1, Ordering::Relaxed);
-                                            return;
-                                        }
-                                    };
-                                    if let Err(error) = socket.write_all(&frame) {
-                                        warn!("AAC TCP write failed: {error}");
-                                        stats.audio_send_errors.fetch_add(1, Ordering::Relaxed);
-                                        return;
-                                    }
-                                    stats.packets_sent.fetch_add(1, Ordering::Relaxed);
-                                    output_index += 1;
-                                }
-                            }
-                        }
-                    })?,
-            );
         }
 
         info!(
@@ -1423,7 +1121,6 @@ impl Ap2Session {
             progress_disabled: false,
             last_artwork_hash: None,
             remote_commands: Some(remote_rx),
-            _ptp_lease: ptp_lease,
         })
     }
 

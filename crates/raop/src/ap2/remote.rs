@@ -78,11 +78,9 @@ fn extract_volume(dict: &plist::Dictionary) -> Option<f32> {
         Value::String(s) => s.trim().parse::<f32>().ok()?,
         _ => return None,
     };
-    if val.is_finite() {
-        Some(val.clamp(0.0, 1.0))
-    } else {
-        None
-    }
+    // dvlc is a normalized slider value. Other units (notably negative dB)
+    // must not be clamped to zero: doing so mutes a Windows endpoint.
+    (val.is_finite() && (0.0..=1.0).contains(&val)).then_some(val)
 }
 
 /// Interprets one decoded events-channel body.
@@ -197,14 +195,17 @@ mod tests {
             Event::Command(Command::Volume(0.42))
         );
 
-        // Out-of-bounds volume is clamped to 0.0..=1.0
+        // Out-of-bounds or differently scaled values must not become a mute.
         let mut d = Dictionary::new();
         d.insert("type".into(), "sendMediaRemoteCommand".into());
         d.insert("value".into(), "dvlc".into());
         d.insert("volume".into(), Value::Real(1.5));
         assert_eq!(
             parse_event(&Value::Dictionary(d)),
-            Event::Command(Command::Volume(1.0))
+            Event::Unsupported {
+                value: Some("dvlc".into()),
+                number: None,
+            }
         );
 
         let mut d = Dictionary::new();
@@ -213,7 +214,10 @@ mod tests {
         d.insert("volume".into(), Value::Real(-0.2));
         assert_eq!(
             parse_event(&Value::Dictionary(d)),
-            Event::Command(Command::Volume(0.0))
+            Event::Unsupported {
+                value: Some("dvlc".into()),
+                number: None,
+            }
         );
 
         // Non-finite volume is dropped to Unsupported

@@ -286,7 +286,12 @@ pub fn start_pipeline_feeder(
                     last_activity = Instant::now();
                 }
 
-                std::thread::sleep(Duration::from_millis(2));
+                // Live sources already pace reads. Adding a fixed delay after
+                // each USB 10 ms chunk makes the feeder fall behind Windows
+                // audio and repeatedly discard buffered packets.
+                if !source.is_live() {
+                    std::thread::sleep(Duration::from_millis(2));
+                }
             }
 
             let _ = source.stop();

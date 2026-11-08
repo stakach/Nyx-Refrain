@@ -10,6 +10,7 @@
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -122,6 +123,8 @@ pub struct Ap2Config {
     /// Delay between stream SETUP and the nominal first audio packet.
     /// Third-party receivers may need a longer lead than HomePods.
     pub start_lead_ms: u32,
+    /// Shared timeline for receivers playing different channels of one stereo endpoint.
+    pub group_timing: Option<Arc<GroupTiming>>,
     /// Bytes 2..3 of sync packets (0x0007 iTunes / 0x0004 AirPlay).
     pub sync_flag: SyncFlag,
     /// Night/safety mode: force `volume: -144` and clamp samples above -60 dBFS (counted as
@@ -132,6 +135,50 @@ pub struct Ap2Config {
     /// Default `false`. When enabled, receivers show a one-hour progress bar until real progress
     /// (with a known duration) arrives.
     pub initial_progress: bool,
+}
+
+/// One clock and one start anchor for a group of independent AirPlay sessions.
+#[derive(Debug)]
+pub struct GroupTiming {
+    clock: Clock,
+    ready: tokio::sync::Barrier,
+    start_at: Mutex<Option<Instant>>,
+}
+
+impl GroupTiming {
+    pub fn new(members: usize) -> Self {
+        Self {
+            clock: Clock::init(),
+            ready: tokio::sync::Barrier::new(members),
+            start_at: Mutex::new(None),
+        }
+    }
+
+    async fn start_at(&self, lead: Duration) -> Result<Instant, Ap2Error> {
+        tokio::time::timeout(Duration::from_secs(15), self.ready.wait())
+            .await
+            .map_err(|_| Ap2Error::Rtsp("timed out waiting for grouped AirPlay receiver".into()))?;
+        let mut anchor = self.start_at.lock().unwrap();
+        Ok(*anchor.get_or_insert_with(|| Instant::now() + lead))
+    }
+}
+
+#[cfg(test)]
+mod group_timing_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn members_share_one_start_and_rtp_clock() {
+        let group = Arc::new(GroupTiming::new(2));
+        let (left, right) = tokio::join!(
+            group.start_at(Duration::from_millis(200)),
+            group.start_at(Duration::from_millis(200))
+        );
+        let left = left.unwrap();
+        let right = right.unwrap();
+        assert_eq!(left, right);
+        assert_eq!(group.clock.rtp_ts(left), group.clock.rtp_ts(right));
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -161,6 +208,7 @@ impl Default for Ap2Config {
             codec: Ap2AudioCodec::Alac,
             prefill_ms: 0,
             start_lead_ms: 1_000,
+            group_timing: None,
             sync_flag: SyncFlag::ITunes,
             quiet_mode: true,
             transcript: None,
@@ -589,6 +637,15 @@ impl Ap2Session {
     where
         F: FnMut(&mut [i16; SAMPLES_PER_PACKET]) + Send + 'static,
     {
+        Self::start_indexed(cfg, move |_, pcm| source(pcm)).await
+    }
+
+    /// Starts packet-aligned audio from a shared media timeline. `index` is
+    /// identical for every receiver using the same [`GroupTiming`].
+    pub async fn start_indexed<F>(cfg: Ap2Config, mut source: F) -> Result<Self, Ap2Error>
+    where
+        F: FnMut(u64, &mut [i16; SAMPLES_PER_PACKET]) + Send + 'static,
+    {
         let (bind_ip, iface_index) =
             resolve_local(cfg.target, cfg.local_ip, cfg.interface_name.as_deref());
         let stream = match bind_ip {
@@ -710,7 +767,10 @@ impl Ap2Session {
         let timing_sock = bind_udp()?;
         let control_sock = bind_udp()?;
         let audio_sock = bind_udp()?;
-        let clock = Clock::init();
+        let clock = cfg
+            .group_timing
+            .as_ref()
+            .map_or_else(Clock::init, |group| group.clock);
 
         let mut threads: Vec<std::thread::JoinHandle<()>> = Vec::new();
         // Timing responder must run before SETUP (the receiver probes during SETUP).
@@ -881,7 +941,13 @@ impl Ap2Session {
         let seq0: u16 = rand::random();
         // RECORD and FLUSH still need round trips. Leave enough lead time for
         // third-party receivers to arm their playout clock before packet zero.
-        let start_at = Instant::now() + Duration::from_millis(cfg.start_lead_ms as u64);
+        let start_at = if let Some(group) = &cfg.group_timing {
+            group
+                .start_at(Duration::from_millis(cfg.start_lead_ms as u64))
+                .await?
+        } else {
+            Instant::now() + Duration::from_millis(cfg.start_lead_ms as u64)
+        };
         let rtp0 = clock.rtp_ts(start_at);
         let rtp_info = format!("seq={seq0};rtptime={rtp0}");
 
@@ -1080,7 +1146,7 @@ impl Ap2Session {
                         if send_at > now {
                             pipeline::wait_until(send_at);
                         }
-                        source(&mut pcm);
+                        source(idx, &mut pcm);
                         guard.process_s16(&mut pcm);
                         let payload_len = match cfg.codec {
                             Ap2AudioCodec::Pcm => {
